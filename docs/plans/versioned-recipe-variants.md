@@ -1,6 +1,6 @@
 # Implementation Plan: Deterministic versioned recipe variants
 
-**Status:** Active (auto-approved)
+**Status:** Complete
 **Approval authority:** pre-approval by Xavier Dedenbach, 2026-09-04T17:49:20Z (auto-approved)
 **Activation authority:** pre-approval by Xavier Dedenbach, 2026-09-04T17:49:20Z (auto-approved); Authorized phases: through-completion
 **ADR(s):** none — No-ADR authority: size S per estimate-size
@@ -236,7 +236,7 @@ Level 4, protocol-faithful fakes. The repository’s established tests exercise 
 ## 9. Primary Linear issue
 
 - **Identity:** [MR-696 — Add deterministic versioned Cronometer recipe variants](https://linear.app/morpheus-robotics/issue/MR-696/add-deterministic-versioned-cronometer-recipe-variants)
-- **Reconciliation state:** linked — exact stable key verified; top-level `parentId=null`; no project; `feat`; In Progress
+- **Reconciliation state:** linked — exact stable key verified; top-level `parentId=null`; no project; `feat`; In Review
 - **Desired title:** Add deterministic versioned Cronometer recipe variants
 - **High-level description:** Extend the Python MCP with preview and immutable create flows for scaled/substituted recipes, visible-owned version allocation, process-local duplicate protection, cooked-yield versions, and account-level sharing guidance. Spoken and Notion inputs are normalized by the caller. Plan: `docs/plans/versioned-recipe-variants.md`; `Execution-Plan: XavierDedenbach/cronometer-api-mcp:docs/plans/versioned-recipe-variants.md`; project none; `parentId=null`.
 
@@ -257,7 +257,7 @@ The S-sized execution is tracked entirely on the primary issue; no child issues 
 - [x] Every behavior-changing unit has recorded RED evidence from before its production edit and GREEN evidence afterward
 - [x] Happy-path integration passes — focused recipe-variant/client suite, 44 passed
 - [x] Edge-case matrix passes — invalid weights, water boundaries, replacement mismatch, ownership/fuzzy filtering, duplicate retries, and non-recipe base covered
-- [x] Blast-radius invariants pass — full 75-test regression and immutable `id=0` creation contract
+- [x] Blast-radius invariants pass — full 76-test regression and immutable `id=0` creation contract
 - [x] Configured line/branch coverage meets repository thresholds and has not decreased from the recorded baseline — no configured threshold; 65% vs 57%
 - [x] No test, assertion, coverage threshold, or coverage exclusion was weakened to make the change pass
 - [x] Human-only gates completed or explicitly pending — none
