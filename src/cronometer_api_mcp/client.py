@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import struct
 import threading
@@ -72,6 +73,7 @@ NUTRIENT_IDS = {
     "trans_fat": 605,
     "omega_3": 10001,
     "omega_6": 10002,
+    "water": 255,
 }
 
 # Grams per ounce, matching the value Cronometer's own web client sends for the
@@ -735,6 +737,7 @@ class CronometerClient:
         serving_name: str = "Serving",
         serving_grams: float | None = None,
         comments: str | None = None,
+        cooked_weight_grams: float | None = None,
     ) -> dict:
         """Create a recipe -- a food composed of other foods -- in Cronometer.
 
@@ -762,8 +765,17 @@ class CronometerClient:
             serving_grams: Grams in one serving. Defaults to the full batch
                 weight (i.e. one serving = the whole recipe).
             comments: Free-text recipe notes.
+            cooked_weight_grams: Optional finished batch weight after cooking.
+                Ingredient rows retain their raw weights. When this differs
+                from the raw total, the difference is applied to nutrient 255
+                (water), while every other batch nutrient is conserved. All
+                active recipe measures use the cooked weight; the raw total is
+                returned to the caller as reference metadata.
 
-        Returns {"food_id": int, "total_grams": float, "ingredient_count": int}.
+        Returns a dict containing ``food_id``, ``ingredient_count``, and
+        ``total_grams``, which always remains the raw ingredient total. When
+        ``cooked_weight_grams`` is provided, the dict also includes that
+        finished batch weight.
         """
         if not ingredients:
             raise ValueError("create_recipe requires at least one ingredient")
@@ -789,6 +801,13 @@ class CronometerClient:
             parsed.append((int(food_id), float(grams), measure_id))
 
         total_grams = sum(g for _, g, _ in parsed)
+        if cooked_weight_grams is not None:
+            cooked_weight_grams = float(cooked_weight_grams)
+            if not math.isfinite(cooked_weight_grams) or cooked_weight_grams <= 0:
+                raise ValueError("Cooked recipe weight must be a positive number")
+        effective_weight = (
+            total_grams if cooked_weight_grams is None else cooked_weight_grams
+        )
 
         # One batch call resolves every ingredient's measures, translation, and
         # per-100g nutrient profile.
@@ -824,8 +843,29 @@ class CronometerClient:
                     continue
                 batch_totals[nid] = batch_totals.get(nid, 0.0) + amount * grams / 100.0
 
-        # Cronometer stores recipe nutrients per-100g of the finished batch.
-        scale = 100.0 / total_grams
+        # Cronometer's cooked-weight behavior attributes the entire weight
+        # change to water and leaves every other batch nutrient unchanged.
+        # Fail before the add_food write if the ingredient data cannot support
+        # that representation truthfully.
+        cooked_weight_changed = cooked_weight_grams is not None and round(
+            cooked_weight_grams * 1000
+        ) != round(total_grams * 1000)
+        if cooked_weight_changed:
+            water_id = NUTRIENT_IDS["water"]
+            if water_id not in batch_totals:
+                raise ValueError(
+                    "A changed cooked recipe weight requires tracked water "
+                    "(nutrient 255) on the ingredients"
+                )
+            adjusted_water = batch_totals[water_id] + cooked_weight_grams - total_grams
+            if adjusted_water < 0:
+                raise ValueError(
+                    "Cooked recipe weight loss exceeds tracked water in the ingredients"
+                )
+            batch_totals[water_id] = adjusted_water
+
+        # Cronometer stores recipe nutrients per-100g of the effective batch.
+        scale = 100.0 / effective_weight
         nutrients = [
             {"id": nid, "amount": round(amount * scale, 6)}
             for nid, amount in sorted(batch_totals.items())
@@ -837,7 +877,7 @@ class CronometerClient:
             {
                 "id": 0,
                 "name": serving_name,
-                "value": total_grams if serving_grams is None else serving_grams,
+                "value": effective_weight if serving_grams is None else serving_grams,
                 "amount": 1.0,
                 "type": "Weight",
             },
@@ -852,7 +892,7 @@ class CronometerClient:
             {
                 "id": 0,
                 "name": "full recipe",
-                "value": total_grams,
+                "value": effective_weight,
                 "amount": 1.0,
                 "type": "Weight",
             },
@@ -891,11 +931,14 @@ class CronometerClient:
             len(ingredient_rows),
             total_grams,
         )
-        return {
+        result = {
             "food_id": food_id,
             "total_grams": total_grams,
             "ingredient_count": len(ingredient_rows),
         }
+        if cooked_weight_grams is not None:
+            result["cooked_weight_grams"] = cooked_weight_grams
+        return result
 
     # ------------------------------------------------------------------
     # Recipe import (free-text ingredients)
