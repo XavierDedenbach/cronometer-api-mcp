@@ -475,6 +475,119 @@ def test_create_recipe_missing_ingredient_food_raises(tmp_path):
     assert state["post"] == 0
 
 
+def test_create_recipe_cooked_weight_adjusts_only_water_and_active_measures(tmp_path):
+    """A cooked variant keeps raw rows but models water loss in its density."""
+    client, state = _recipe_client(tmp_path)
+    foods = [dict(food) for food in RECIPE_INGREDIENT_FOODS]
+    foods[0] = {
+        **foods[0],
+        "nutrients": [*foods[0]["nutrients"], {"id": 255, "amount": 70.0}],
+    }
+    foods[1] = {
+        **foods[1],
+        "nutrients": [*foods[1]["nutrients"], {"id": 255, "amount": 60.0}],
+    }
+    client.get_foods = lambda ids: foods  # type: ignore[method-assign]
+
+    result = client.create_recipe(
+        "Cooked Recipe",
+        ingredients=[(1000, 100.0), (2000, 50.0)],
+        cooked_weight_grams=120.0,
+    )
+
+    assert result == {
+        "food_id": 4242,
+        "total_grams": 150.0,
+        "cooked_weight_grams": 120.0,
+        "ingredient_count": 2,
+    }
+    data = state["payloads"][0]["data"]
+    assert sum(row["grams"] for row in data["ingredients"]) == 150.0
+    assert {m["name"]: m["value"] for m in data["measures"]} == {
+        "Serving": 120.0,
+        "g": 1.0,
+        "oz": 28.3495231,
+        "full recipe": 120.0,
+    }
+    amounts = {n["id"]: n["amount"] for n in data["nutrients"]}
+    assert amounts[208] * 1.2 == pytest.approx(350.0)
+    assert amounts[203] * 1.2 == pytest.approx(25.0)
+    # Raw water: 70g + 30g = 100g. A 30g loss leaves 70g in the batch.
+    assert amounts[255] * 1.2 == pytest.approx(70.0)
+
+
+def test_create_recipe_cooked_weight_supports_water_gain(tmp_path):
+    client, state = _recipe_client(tmp_path)
+    foods = [dict(food) for food in RECIPE_INGREDIENT_FOODS]
+    foods[0] = {
+        **foods[0],
+        "nutrients": [*foods[0]["nutrients"], {"id": 255, "amount": 70.0}],
+    }
+    foods[1] = {
+        **foods[1],
+        "nutrients": [*foods[1]["nutrients"], {"id": 255, "amount": 60.0}],
+    }
+    client.get_foods = lambda ids: foods  # type: ignore[method-assign]
+
+    client.create_recipe(
+        "Hydrated Recipe",
+        ingredients=[(1000, 100.0), (2000, 50.0)],
+        cooked_weight_grams=180.0,
+    )
+
+    amounts = {n["id"]: n["amount"] for n in state["payloads"][0]["data"]["nutrients"]}
+    assert amounts[208] * 1.8 == pytest.approx(350.0)
+    assert amounts[255] * 1.8 == pytest.approx(130.0)
+
+
+def test_create_recipe_cooked_weight_compares_at_milligram_precision(tmp_path):
+    client, state = _recipe_client(tmp_path)
+
+    client.create_recipe(
+        "Floating Point Recipe",
+        ingredients=[(1000, 0.1), (2000, 0.2)],
+        cooked_weight_grams=0.3,
+    )
+
+    assert state["post"] == 1
+
+
+@pytest.mark.parametrize(
+    ("foods", "cooked_weight", "message"),
+    [
+        (RECIPE_INGREDIENT_FOODS, 120.0, "requires tracked water"),
+        (
+            [
+                {
+                    **RECIPE_INGREDIENT_FOODS[0],
+                    "nutrients": [
+                        *RECIPE_INGREDIENT_FOODS[0]["nutrients"],
+                        {"id": 255, "amount": 10.0},
+                    ],
+                },
+                RECIPE_INGREDIENT_FOODS[1],
+            ],
+            120.0,
+            "exceeds tracked water",
+        ),
+    ],
+)
+def test_create_recipe_cooked_weight_fails_closed_before_write(
+    tmp_path, foods, cooked_weight, message
+):
+    client, state = _recipe_client(tmp_path)
+    client.get_foods = lambda ids: foods  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match=message):
+        client.create_recipe(
+            "Invalid Cooked Recipe",
+            ingredients=[(1000, 100.0), (2000, 50.0)],
+            cooked_weight_grams=cooked_weight,
+        )
+
+    assert state["post"] == 0
+
+
 # ---------------------------------------------------------------------------
 # import_recipe
 #

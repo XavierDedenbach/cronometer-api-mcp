@@ -20,6 +20,7 @@ Unlike [cronometer-mcp](https://github.com/cphoskins/cronometer-mcp), which take
 - **Food search** -- search the Cronometer food database, get detailed nutrition info
 - **Diary management** -- add/remove entries, copy days, mark days complete
 - **Custom foods** -- create foods with custom nutrition data
+- **Recipe variants** -- preview and create immutable, proportionally scaled recipes with substitutions, cooked yield, version allocation, and duplicate protection
 - **Macro targets** -- read weekly schedule and saved templates
 - **Fasting** -- view history and aggregate statistics
 - **Biometrics** -- weight, body fat, heart rate, and other tracked metrics over a date range
@@ -137,6 +138,9 @@ cached session, so it also overrides a stale cached timezone.
 | `add_custom_food` | Create a custom food with specified nutrition |
 | `add_recipe` | Create a recipe from existing foods referenced by ID and gram weight |
 | `import_recipe` | Create a recipe from a free-text ingredient list; Cronometer matches each line to a database food and converts the amount to grams |
+| `preview_recipe_variant` | Preview scaling, fixed ingredients, substitutions, exact overrides, cooked yield, the next visible owned `_NNN` version, and any visible duplicate without writing |
+| `create_recipe_variant` | Create an immutable versioned recipe, or return a matching visible owned variant without another write |
+| `get_recipe_share_info` | Return the exact-name workflow and Gold/friend prerequisites for Cronometer's account-level recipe sharing; performs no sharing write |
 | `copy_day` | Copy all entries from the previous day |
 | `mark_day_complete` | Mark a diary day as complete or incomplete |
 
@@ -151,6 +155,59 @@ cached session, so it also overrides a stale cached timezone.
 | `get_biometrics` | Biometric time series (e.g. weight, body fat) within a date range |
 
 All date parameters use `YYYY-MM-DD` format and default to today when omitted.
+
+## Versioned Recipe Workflow
+
+Spoken requests and Notion pages are intentionally handled by the MCP client
+(for example, Codex), where transcription and page access already live. The
+client resolves each ingredient with `search_foods`, converts the recipe into
+exact food IDs and gram weights, then sends the same structured arguments first
+to `preview_recipe_variant` and—after review—to `create_recipe_variant`.
+
+For example, suppose recipe `84201` contains 10 lb (4535.924 g) of chicken,
+rice, spices, and one 150 g onion. This preview changes the chicken anchor to
+11 lb, keeps the onion fixed, scales the remaining ingredients by 1.1, and
+replaces the chicken with an exact breast/thigh split:
+
+```json
+{
+  "base_recipe_id": 84201,
+  "anchor_food_ids": [111],
+  "target_anchor_grams": 4989.516,
+  "fixed_food_ids": [222],
+  "replacement_ingredients": [
+    {"food_id": 111, "grams": 3000.0},
+    {"food_id": 333, "grams": 1989.516}
+  ],
+  "overrides": []
+}
+```
+
+Use those arguments with `preview_recipe_variant`. Its response contains the
+final ingredient rows, raw total, scale factor, proposed name such as
+`Chicken Bowl_004`, and duplicate status. Send the same values to
+`create_recipe_variant` to save the recipe. Initial uploads use `base_name` and
+`ingredients` instead of `base_recipe_id`; `overrides` can set or add any exact
+final ingredient weight.
+
+Recipe edits never mutate prior versions or diary history. A post-cooking yield
+is another immutable version: call the preview/create pair with the prior
+`base_recipe_id` and `cooked_weight_grams`. Raw ingredient rows remain intact,
+non-water batch nutrients are conserved, and the weight difference is applied
+to water as [Cronometer documents](https://support.cronometer.com/hc/en-us/articles/4406291608724-Set-Cooked-Recipe-Weight).
+A changed yield fails before the recipe write if the ingredients do not contain
+water data or the loss exceeds tracked water.
+
+Version discovery and duplicate protection are deliberately bounded. They cover
+owned Custom recipe variants visible in the current Cronometer search response,
+and concurrent calls are serialized within one MCP server process. Cronometer
+does not document search result completeness, and separate MCP processes do not
+share a lock, so the tool response repeats this limitation.
+
+Cronometer Gold [friend sharing](https://support.cronometer.com/hc/en-us/articles/360018867471-Sharing)
+is account-level, not a per-recipe API write.
+After friends are connected under **More > Sharing > Friends**, they can find a
+completed recipe by its exact versioned name in **Add Food**.
 
 ## Transport
 
@@ -219,6 +276,14 @@ print(recipe["food_id"], recipe["ingredients"])
 
 # Parse without saving, to review the matches first
 preview = client.import_recipe("2 tbsp olive oil\n200g chicken", save=False)
+
+# Create a weight-based recipe whose finished batch weighs 850 g. The client
+# retains the raw ingredient rows and applies the weight difference to water.
+cooked = client.create_recipe(
+    "Chicken Bowl_004",
+    ingredients=[(111, 700.0), (222, 200.0)],
+    cooked_weight_grams=850.0,
+)
 
 # Get nutrition scores
 scores = client.get_nutrition_scores()

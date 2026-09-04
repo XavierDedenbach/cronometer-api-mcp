@@ -16,6 +16,7 @@ EXPECTED_TOOLS = {
     "add_food_entry",
     "add_recipe",
     "copy_day",
+    "create_recipe_variant",
     "get_biometrics",
     "get_daily_nutrition",
     "get_fasting_history",
@@ -24,9 +25,11 @@ EXPECTED_TOOLS = {
     "get_food_log",
     "get_macro_targets",
     "get_nutrition_scores",
+    "get_recipe_share_info",
     "import_recipe",
     "list_biometrics",
     "mark_day_complete",
+    "preview_recipe_variant",
     "remove_food_entry",
     "search_foods",
 }
@@ -93,6 +96,10 @@ def test_tool_annotations_survive_schema_coercion():
 
     assert tools["get_food_log"].annotations.read_only_hint is True
     assert tools["add_food_entry"].annotations.read_only_hint is False
+    assert tools["preview_recipe_variant"].annotations.read_only_hint is True
+    assert tools["create_recipe_variant"].annotations.read_only_hint is False
+    assert tools["create_recipe_variant"].annotations.idempotent_hint is True
+    assert tools["get_recipe_share_info"].annotations.read_only_hint is True
 
 
 def test_no_client_constructed_at_import():

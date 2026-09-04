@@ -10,6 +10,14 @@ from importlib.metadata import version as _pkg_version
 from mcp.server.mcpserver import MCPServer
 
 from .client import CronometerClient
+from .recipe_variants import (
+    IDEMPOTENCY_SCOPE,
+    build_variant,
+    discover_owned_versions,
+    extract_recipe,
+    recipe_stem,
+    sharing_info,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,7 +44,9 @@ mcp = MCPServer(
         "macro targets, biometrics, and fasting history from Cronometer. "
         "Use search_foods to find foods, get_food_details for nutrition info "
         "and serving sizes, add_food_entry to log meals, and get_food_log to "
-        "review what was eaten."
+        "review what was eaten. Use preview_recipe_variant before "
+        "create_recipe_variant to scale or substitute recipe ingredients and "
+        "save immutable versioned recipes."
     ),
     version=_server_version(),
 )
@@ -46,6 +56,10 @@ _client: CronometerClient | None = None
 # worker threads, so concurrent first-calls would otherwise build a client each,
 # meaning two logins against a rate-limited endpoint (#3).
 _client_lock = threading.Lock()
+# The duplicate check, visible-version allocation, and create call are one
+# process-local critical section. Cross-process serialization is deliberately
+# outside the tool's documented guarantee.
+_recipe_variant_lock = threading.Lock()
 
 
 def _get_client() -> CronometerClient:
@@ -629,6 +643,7 @@ def add_recipe(
     serving_name: str = "Serving",
     serving_grams: float | None = None,
     comments: str | None = None,
+    cooked_weight_grams: float | None = None,
 ) -> str:
     """Create a recipe in Cronometer from other foods in the database.
 
@@ -648,6 +663,9 @@ def add_recipe(
         serving_grams: Grams in one serving. Defaults to the full batch weight
             (one serving = the whole recipe).
         comments: Free-text recipe notes.
+        cooked_weight_grams: Optional finished batch weight after cooking.
+            Cronometer-compatible water adjustment is applied by the client;
+            raw ingredient rows remain unchanged.
     """
     try:
         parsed = []
@@ -670,6 +688,7 @@ def add_recipe(
             serving_name=serving_name,
             serving_grams=serving_grams,
             comments=comments,
+            cooked_weight_grams=cooked_weight_grams,
         )
 
         # Fetch back to get the server-assigned measure_id
@@ -680,8 +699,289 @@ def add_recipe(
                 "measure_id": food_data.get("defaultMeasureId"),
                 "name": name,
                 "total_grams": result["total_grams"],
+                "cooked_weight_grams": result.get("cooked_weight_grams"),
                 "ingredient_count": result["ingredient_count"],
                 "note": "Use food_id and measure_id with add_food_entry to log this recipe.",
+            }
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def _prepare_recipe_variant(
+    client: CronometerClient,
+    *,
+    base_recipe_id: int | None,
+    base_name: str | None,
+    ingredients: list[dict] | None,
+    anchor_food_ids: list[int] | None,
+    target_anchor_grams: float | None,
+    fixed_food_ids: list[int] | None,
+    replacement_ingredients: list[dict] | None,
+    overrides: list[dict] | None,
+    cooked_weight_grams: float | None,
+    comments: str | None,
+) -> dict:
+    """Resolve one variant request without writing to Cronometer."""
+    known_foods = None
+    if base_recipe_id is not None:
+        if ingredients is not None:
+            raise ValueError("Use either base_recipe_id or ingredients, not both")
+        base_food = client.get_food(base_recipe_id)
+        base = extract_recipe(base_food)
+        known_foods = [base_food]
+        source_ingredients = base["ingredients"]
+        resolved_name = recipe_stem(base_name or base["name"])
+        resolved_comments = base["comments"] if comments is None else comments
+    else:
+        if ingredients is None:
+            raise ValueError("ingredients is required without base_recipe_id")
+        if base_name is None:
+            raise ValueError("base_name is required without base_recipe_id")
+        source_ingredients = ingredients
+        resolved_name = recipe_stem(base_name)
+        resolved_comments = comments
+
+    variant = build_variant(
+        source_ingredients,
+        anchor_food_ids=anchor_food_ids,
+        target_anchor_grams=target_anchor_grams,
+        fixed_food_ids=fixed_food_ids,
+        replacement_ingredients=replacement_ingredients,
+        overrides=overrides,
+        cooked_weight_grams=cooked_weight_grams,
+    )
+    discovery = discover_owned_versions(
+        client,
+        resolved_name,
+        variant["fingerprint"],
+        known_foods=known_foods,
+    )
+    return {
+        "base_name": resolved_name,
+        **variant,
+        **discovery,
+        "idempotency_scope": IDEMPOTENCY_SCOPE,
+        "sharing": sharing_info(discovery["proposed_name"]),
+        "_comments": resolved_comments,
+    }
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+def preview_recipe_variant(
+    base_recipe_id: int | None = None,
+    base_name: str | None = None,
+    ingredients: list[dict] | None = None,
+    anchor_food_ids: list[int] | None = None,
+    target_anchor_grams: float | None = None,
+    fixed_food_ids: list[int] | None = None,
+    replacement_ingredients: list[dict] | None = None,
+    overrides: list[dict] | None = None,
+    cooked_weight_grams: float | None = None,
+    comments: str | None = None,
+) -> str:
+    """Preview a deterministic, immutable recipe variant without creating it.
+
+    Use ``base_recipe_id`` to copy an existing Cronometer recipe, or provide
+    ``base_name`` plus exact ``ingredients`` objects. Spoken requests and
+    Notion recipes should be normalized by the MCP caller into food IDs and
+    gram weights before calling this tool.
+
+    To scale a batch by its chicken (or another anchor), pass the original
+    ``anchor_food_ids`` and ``target_anchor_grams``. Ingredients scale by the
+    resulting ratio except IDs in ``fixed_food_ids`` (for example, one onion).
+    ``replacement_ingredients`` replaces the anchor with exact foods/weights,
+    such as a breast-and-thigh split, and must sum to the target anchor weight.
+    ``overrides`` sets exact final weights for any other changed ingredients.
+
+    Version and duplicate discovery covers only owned Custom recipes visible
+    in the current Cronometer search response. The result states that boundary.
+
+    Args:
+        base_recipe_id: Existing recipe ID to copy and version.
+        base_name: Version stem. Defaults to the base recipe name with `_NNN`
+            removed; required when providing ingredients directly.
+        ingredients: Exact base rows: food_id, grams, optional measure_id.
+        anchor_food_ids: Food IDs whose original total defines the scale ratio.
+        target_anchor_grams: Desired total anchor weight in grams.
+        fixed_food_ids: Existing ingredient IDs that must not scale.
+        replacement_ingredients: Exact rows replacing all anchor rows.
+        overrides: Exact final rows replacing or adding foods after scaling.
+        cooked_weight_grams: Optional measured finished-batch weight.
+        comments: Notes for a future create; defaults to base recipe notes.
+    """
+    try:
+        preview = _prepare_recipe_variant(
+            _get_client(),
+            base_recipe_id=base_recipe_id,
+            base_name=base_name,
+            ingredients=ingredients,
+            anchor_food_ids=anchor_food_ids,
+            target_anchor_grams=target_anchor_grams,
+            fixed_food_ids=fixed_food_ids,
+            replacement_ingredients=replacement_ingredients,
+            overrides=overrides,
+            cooked_weight_grams=cooked_weight_grams,
+            comments=comments,
+        )
+        preview.pop("_comments", None)
+        return _ok(preview)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+def create_recipe_variant(
+    base_recipe_id: int | None = None,
+    base_name: str | None = None,
+    ingredients: list[dict] | None = None,
+    anchor_food_ids: list[int] | None = None,
+    target_anchor_grams: float | None = None,
+    fixed_food_ids: list[int] | None = None,
+    replacement_ingredients: list[dict] | None = None,
+    overrides: list[dict] | None = None,
+    cooked_weight_grams: float | None = None,
+    serving_name: str = "Serving",
+    serving_grams: float | None = None,
+    comments: str | None = None,
+) -> str:
+    """Create one immutable `_NNN` recipe variant after a final preview.
+
+    The search/fingerprint/allocation/create path is serialized inside one MCP
+    server process. If an owned visible variant has the same canonical
+    ingredient weights and effective cooked yield, it is returned without
+    another write. Otherwise this always creates a new recipe (`id=0`); it
+    never mutates the base recipe or diary history.
+
+    Cronometer sharing is account-level: the response tells configured Gold
+    friends which exact recipe name to search. This tool does not alter friend
+    settings or perform a selective sharing write.
+
+    Args:
+        base_recipe_id: Existing recipe ID to copy and version, as in
+            ``preview_recipe_variant``.
+        base_name: Version stem, as in ``preview_recipe_variant``.
+        ingredients: Exact base ingredient rows, as in
+            ``preview_recipe_variant``.
+        anchor_food_ids: Food IDs defining the scale ratio, as in
+            ``preview_recipe_variant``.
+        target_anchor_grams: Desired anchor total, as in
+            ``preview_recipe_variant``.
+        fixed_food_ids: Ingredient IDs excluded from scaling, as in
+            ``preview_recipe_variant``.
+        replacement_ingredients: Exact rows replacing anchor ingredients, as
+            in ``preview_recipe_variant``.
+        overrides: Exact final ingredient rows, as in
+            ``preview_recipe_variant``.
+        cooked_weight_grams: Optional finished-batch weight, as in
+            ``preview_recipe_variant``.
+        serving_name: Default serving label for a newly created recipe.
+        serving_grams: Optional grams per default serving.
+        comments: Notes for the new recipe; defaults to the base recipe notes
+            when copying an existing recipe.
+    """
+    try:
+        client = _get_client()
+        with _recipe_variant_lock:
+            preview = _prepare_recipe_variant(
+                client,
+                base_recipe_id=base_recipe_id,
+                base_name=base_name,
+                ingredients=ingredients,
+                anchor_food_ids=anchor_food_ids,
+                target_anchor_grams=target_anchor_grams,
+                fixed_food_ids=fixed_food_ids,
+                replacement_ingredients=replacement_ingredients,
+                overrides=overrides,
+                cooked_weight_grams=cooked_weight_grams,
+                comments=comments,
+            )
+            resolved_comments = preview.pop("_comments", None)
+            duplicate = preview["duplicate"]
+            if duplicate is not None:
+                return _ok(
+                    {
+                        **preview,
+                        "created": False,
+                        "food_id": duplicate["food_id"],
+                        "name": duplicate["name"],
+                    }
+                )
+
+            ingredient_tuples = []
+            for item in preview["ingredients"]:
+                if item["measure_id"] is None:
+                    ingredient_tuples.append((item["food_id"], item["grams"]))
+                else:
+                    ingredient_tuples.append(
+                        (item["food_id"], item["grams"], item["measure_id"])
+                    )
+            result = client.create_recipe(
+                preview["proposed_name"],
+                ingredients=ingredient_tuples,
+                serving_name=serving_name,
+                serving_grams=serving_grams,
+                comments=resolved_comments,
+                cooked_weight_grams=preview["cooked_weight_grams"],
+            )
+            food_data = client.get_food(result["food_id"])
+            return _ok(
+                {
+                    **preview,
+                    "created": True,
+                    "food_id": result["food_id"],
+                    "measure_id": food_data.get("defaultMeasureId"),
+                    "name": preview["proposed_name"],
+                    "note": (
+                        "Use food_id and measure_id with add_food_entry to log "
+                        "this immutable recipe version."
+                    ),
+                }
+            )
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+def get_recipe_share_info(recipe_id: int) -> str:
+    """Return exact-name instructions for Cronometer's recipe sharing.
+
+    Cronometer Gold friends who have accepted one another under More > Sharing
+    > Friends can search one another's custom foods and recipes by name. This
+    tool validates the recipe and reports that account-level workflow; it does
+    not change sharing settings or expose diary data.
+
+    Args:
+        recipe_id: Existing Cronometer recipe ID.
+    """
+    try:
+        recipe = extract_recipe(_get_client().get_food(recipe_id))
+        return _ok(
+            {
+                "food_id": recipe["food_id"],
+                "name": recipe["name"],
+                "sharing": sharing_info(recipe["name"]),
             }
         )
     except Exception as e:
